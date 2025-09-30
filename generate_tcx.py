@@ -32,6 +32,27 @@ def haversine_distance(lat1, lon1, lat2, lon2):
     
     return R * c
 
+def smooth_altitude_data(location_data, window_size=21):
+    """Applies a rolling average filter to smooth out GPS altitude jitter."""
+    if not location_data:
+        return location_data
+
+    raw_altitudes = [p['altitude'] for p in location_data]
+    smoothed_altitudes = []
+
+    for i in range(len(raw_altitudes)):
+        start = max(0, i - window_size // 2)
+        end = min(len(raw_altitudes), i + window_size // 2 + 1)
+        window = raw_altitudes[start:end]
+        smoothed_altitudes.append(sum(window) / len(window))
+
+    # Add the smoothed data back into the main data structure
+    for i, point in enumerate(location_data):
+        point['altitude_smoothed'] = smoothed_altitudes[i]
+    
+    return location_data
+
+
 def calculate_and_print_summary(location_data, heart_rate_data, cadence_data, calories):
     """Calculates and prints a summary of the activity."""
     if not location_data:
@@ -47,11 +68,14 @@ def calculate_and_print_summary(location_data, heart_rate_data, cadence_data, ca
         point2 = location_data[i]
         total_distance += haversine_distance(point1['latitude'], point1['longitude'], point2['latitude'], point2['longitude'])
     
-    # --- Elevation Gain ---
+    # --- Elevation Gain (using smoothed data) ---
+    location_data = smooth_altitude_data(location_data)
     elevation_gain = 0
     for i in range(1, len(location_data)):
-        if location_data[i]['altitude'] > location_data[i-1]['altitude']:
-            elevation_gain += location_data[i]['altitude'] - location_data[i-1]['altitude']
+        # Calculate gain based on the new, smoothed altitude values
+        altitude_change = location_data[i]['altitude_smoothed'] - location_data[i-1]['altitude_smoothed']
+        if altitude_change > 0: # Any positive change on the smoothed line is counted
+            elevation_gain += altitude_change
 
     # --- Averages ---
     avg_hr = sum(hr for _, hr in heart_rate_data) / len(heart_rate_data) if heart_rate_data else 0
