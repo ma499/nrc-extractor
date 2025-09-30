@@ -95,70 +95,110 @@ def find_nearest_metric(target_time, metric_list):
     )
     return closest_metric[1]
 
-def fetch_data(cursor, activity_id):
-    """Fetches and prepares all necessary data from the database."""
-    
-    # --- Fetch Location and Altitude Data ---
-    cursor.execute("""
-        SELECT
-            m1.startDate,
-            m1.coordinateValue,
-            (SELECT m2.doubleValue FROM metrics m2 WHERE m2.activityID = ? AND m2.source = 'com.nike.running.ios.corelocation' AND m2.coordinateValue IS NULL AND m2.startDate = m1.startDate) AS altitude
-        FROM metrics m1
-        WHERE m1.activityID = ?
-          AND m1.source = 'com.nike.running.ios.corelocation'
-          AND m1.coordinateValue IS NOT NULL
-        ORDER BY m1.startDate;
-    """, (activity_id, activity_id))
+def detect_schema(cursor):
+    """Detects if the metrics table uses the iPhone or Watch schema by checking column names."""
+    cursor.execute("PRAGMA table_info(metrics);")
+    columns = {row[1] for row in cursor.fetchall()}
+    if 'value' in columns and 'secondaryValue' in columns:
+        print("Info: Apple Watch database schema detected.")
+        return 'watch'
+    elif 'doubleValue' in columns and 'intValue' in columns:
+        print("Info: iPhone database schema detected.")
+        return 'iphone'
+    else:
+        raise ValueError("Unknown or invalid metrics table schema. Could not find required columns.")
 
+def fetch_data(cursor, activity_id):
+    """
+    Fetches and prepares all necessary data from the database,
+    dispatching to the correct function based on the detected schema.
+    """
+    schema = detect_schema(cursor)
+
+    # --- Define queries for each schema ---
+    queries = {
+        'iphone': {
+            'location': """
+                SELECT startDate, coordinateValue FROM metrics WHERE activityID = ? AND source = 'com.nike.running.ios.corelocation' AND coordinateValue IS NOT NULL ORDER BY startDate;
+            """,
+            'altitude': """
+                SELECT startDate, doubleValue FROM metrics WHERE activityID = ? AND source = 'com.nike.running.ios.corelocation' AND coordinateValue IS NULL ORDER BY startDate;
+            """,
+            'heart_rate': """
+                SELECT startDate, intValue FROM metrics WHERE activityID = ? AND source = 'com.nike.running.ios.healthkit' AND intValue IS NOT NULL ORDER BY startDate;
+            """,
+            'cadence': """
+                SELECT startDate, doubleValue FROM metrics WHERE activityID = ? AND source = 'com.nike.running.ios.coremotion' AND doubleValue > 100 AND intValue IS NULL ORDER BY startDate;
+            """,
+            'calories': """
+                SELECT MAX(intValue) FROM metrics WHERE activityID = ? AND source = 'com.nike.running.ios.calculatedcalories';
+            """
+        },
+        'watch': {
+            'location': """
+                SELECT startDate, value, secondaryValue FROM metrics WHERE activityID = ? AND source = 'com.nike.running.ios.corelocation' AND secondaryValue IS NOT NULL ORDER BY startDate;
+            """,
+            'altitude': """
+                SELECT startDate, value FROM metrics WHERE activityID = ? AND source = 'com.nike.running.ios.corelocation' AND secondaryValue IS NULL ORDER BY startDate;
+            """,
+            'heart_rate': """
+                SELECT startDate, value FROM metrics WHERE activityID = ? AND source = 'com.nike.running.ios.healthkit' ORDER BY startDate;
+            """,
+            'cadence': """
+                SELECT startDate, value FROM metrics WHERE activityID = ? AND source = 'com.nike.running.ios.coremotion' AND value > 100 ORDER BY startDate;
+            """,
+            'calories': """
+                SELECT MAX(value) FROM metrics WHERE activityID = ? AND source = 'com.nike.running.ios.calculatedcalories';
+            """
+        }
+    }
+
+    q = queries[schema]
+
+    # --- Fetch Location & Altitude Data ---
+    cursor.execute(q['altitude'], (activity_id,))
+    altitude_data = [(parse_time(row[0]), float(row[1])) for row in cursor.fetchall()]
+
+    cursor.execute(q['location'], (activity_id,))
     location_data = []
-    for row in cursor.fetchall():
-        time_str, coords_str, altitude = row
-        if coords_str and ',' in coords_str:
-            lat_str, lon_str = coords_str.split(',')
+    
+    # Process location data which has a different structure for each schema
+    if schema == 'iphone':
+        for row in cursor.fetchall():
+            time_str, coords_str = row
+            if coords_str and ',' in coords_str:
+                lat_str, lon_str = coords_str.split(',')
+                loc_time = parse_time(time_str)
+                nearest_altitude = find_nearest_metric(loc_time, altitude_data)
+                location_data.append({
+                    "time": loc_time, "latitude": float(lat_str), "longitude": float(lon_str),
+                    "altitude": nearest_altitude if nearest_altitude is not None else 0.0
+                })
+    else: # watch schema
+        for row in cursor.fetchall():
+            time_str, lat, lon = row
+            loc_time = parse_time(time_str)
+            nearest_altitude = find_nearest_metric(loc_time, altitude_data)
             location_data.append({
-                "time": parse_time(time_str),
-                "latitude": float(lat_str),
-                "longitude": float(lon_str),
-                "altitude": float(altitude) if altitude else 0.0
+                "time": loc_time, "latitude": float(lat), "longitude": float(lon),
+                "altitude": nearest_altitude if nearest_altitude is not None else 0.0
             })
 
     # --- Fetch Heart Rate Data ---
-    cursor.execute("""
-        SELECT startDate, intValue
-        FROM metrics
-        WHERE activityID = ?
-          AND source = 'com.nike.running.ios.healthkit'
-          AND intValue IS NOT NULL
-        ORDER BY startDate;
-    """, (activity_id,))
-    heart_rate_data = [(parse_time(row[0]), row[1]) for row in cursor.fetchall()]
+    cursor.execute(q['heart_rate'], (activity_id,))
+    heart_rate_data = [(parse_time(row[0]), int(float(row[1]))) for row in cursor.fetchall()]
 
     # --- Fetch Cadence Data ---
-    cursor.execute("""
-        SELECT startDate, doubleValue
-        FROM metrics
-        WHERE activityID = ?
-          AND source = 'com.nike.running.ios.coremotion'
-          AND doubleValue > 100 -- Filter for cadence, not speed
-          AND intValue IS NULL
-        ORDER BY startDate;
-    """, (activity_id,))
-    # TCX expects cadence in RPM (revolutions per minute), which is half of SPM (steps per minute) for running.
-    cadence_data = [(parse_time(row[0]), int(row[1] / 2)) for row in cursor.fetchall()]
+    cursor.execute(q['cadence'], (activity_id,))
+    cadence_data = [(parse_time(row[0]), int(float(row[1]) / 2)) for row in cursor.fetchall()]
 
     # --- Fetch Calories Data ---
-    cursor.execute("""
-        SELECT MAX(intValue)
-        FROM metrics
-        WHERE activityID = ?
-          AND source = 'com.nike.running.ios.calculatedcalories';
-    """, (activity_id,))
+    cursor.execute(q['calories'], (activity_id,))
     calories_raw = cursor.fetchone()[0]
-    # Convert from thousandths of a kcal to kcal
-    calories = int(calories_raw / 1000) if calories_raw else 0
+    calories = int(float(calories_raw) / 1000) if calories_raw else 0
 
     return location_data, heart_rate_data, cadence_data, calories
+
 
 def create_tcx_file(location_data, heart_rate_data, cadence_data, output_file):
     """Builds and saves the TCX file from the processed data."""
@@ -167,11 +207,7 @@ def create_tcx_file(location_data, heart_rate_data, cadence_data, output_file):
         print("Error: No location data found for this activity.")
         return
 
-    # --- Create XML Structure ---
-    # Register the namespace to avoid ns0: prefixes
     ET.register_namespace('', "http://www.garmin.com/xmlschemas/TrainingCenterDatabase/v2")
-    
-    # Root element
     tc_db = ET.Element("TrainingCenterDatabase", {
         "xmlns": "http://www.garmin.com/xmlschemas/TrainingCenterDatabase/v2",
         "xmlns:xsi": "http://www.w3.org/2001/XMLSchema-instance",
@@ -189,7 +225,6 @@ def create_tcx_file(location_data, heart_rate_data, cadence_data, output_file):
     lap = ET.SubElement(activity, "Lap", {"StartTime": start_time_str})
     track = ET.SubElement(lap, "Track")
 
-    # --- Populate Trackpoints ---
     for point in location_data:
         trackpoint = ET.SubElement(track, "Trackpoint")
         
@@ -205,21 +240,17 @@ def create_tcx_file(location_data, heart_rate_data, cadence_data, output_file):
         alt = ET.SubElement(trackpoint, "AltitudeMeters")
         alt.text = str(point['altitude'])
 
-        # Find nearest heart rate and add it
         nearest_hr = find_nearest_metric(point['time'], heart_rate_data)
         if nearest_hr is not None:
             hr_bpm = ET.SubElement(trackpoint, "HeartRateBpm")
             hr_val = ET.SubElement(hr_bpm, "Value")
             hr_val.text = str(nearest_hr)
             
-        # Find nearest cadence and add it
         nearest_cadence = find_nearest_metric(point['time'], cadence_data)
         if nearest_cadence is not None:
             cadence_el = ET.SubElement(trackpoint, "Cadence")
             cadence_el.text = str(nearest_cadence)
 
-    # --- Write to File ---
-    # Use minidom for pretty printing (indentation)
     xml_str = ET.tostring(tc_db, 'utf-8')
     pretty_xml_str = minidom.parseString(xml_str).toprettyxml(indent="  ")
     
@@ -256,4 +287,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

@@ -6,9 +6,21 @@ Extract data from Nike Run Club (NRC) app local data on iOS and export into TCX 
 
 ### Extraction of SQLite files
 
-The NRC app's SQLite data must first be extracted from the device. I used [iMazing](https://imazing.com) to read from a local backup of my iPhone. I found the data in the following path:
+The NRC app's SQLite data must first be extracted from the device. 
+
+#### Extraction from iPhone
+I used [iMazing](https://imazing.com) to read from a local backup of my iPhone. I found the data in the following path:
 `/Apps/AppDomain-com.nike.nikeplus-gps/Documents/Activity/DataStore/activity-data-store.sqlite`
 
+#### Extraction from Apple Watch
+1. Open the NRC app.
+1. Swipe left until the Settings page is displayed.
+1. Scroll down until you see the version number at the bottom and tap it 3 times.
+1. Tap the 'DB Browser' option
+1. Find the run that you wish to extract and tap it.
+1. Tap 'Send to Phone'
+
+Your iPhone will then prompt you to save an extracted SQLite file.
 
 ### Explore activity store to identify activity ID
 
